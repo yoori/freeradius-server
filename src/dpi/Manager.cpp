@@ -103,13 +103,19 @@ namespace dpi
     gy_request.request_id = gy_request_id;
     gy_request.user_session_traits = *user_session.traits();
 
-    std::unordered_map<unsigned long, OctetStats> send_rating_groups;
-    for (const auto& rg_id : rating_groups)
+    std::unordered_map<unsigned long, dpi::DiameterSession::GyRequest::UsageRatingGroup> send_rating_groups;
+
+    if (fill_zero_usage_groups)
     {
-      send_rating_groups.emplace(rg_id, OctetStats());
+      for (const auto& rg_id : rating_groups)
+      {
+        send_rating_groups.emplace(
+          rg_id,
+          DiameterSession::GyRequest::UsageRatingGroup(rg_id, OctetStats(), std::nullopt));
+      }
     }
 
-    auto used_limits = user_session.get_gy_used_limits();
+    auto used_limits = user_session.get_gy_used_limits(Gears::Time::get_time_of_day(), true);
     for (const auto& used_limit : used_limits)
     {
       auto session_rule_it = pcc_config->session_keys.find(used_limit.session_key);
@@ -119,15 +125,20 @@ namespace dpi
 
         for (const auto& rg_id : session_key_rule.rating_groups)
         {
-          send_rating_groups[rg_id] += used_limit;
+          auto& send_rating_group = send_rating_groups[rg_id];
+          send_rating_group.rating_group_id = rg_id;
+          send_rating_group += used_limit;
+          if (used_limit.reporting_reason.has_value())
+          {
+            send_rating_group.reporting_reason = used_limit.reporting_reason;
+          }
         }
       }
     }
 
-    for (const auto& [rg_id, rg_use] : send_rating_groups)
+    for (const auto& [_, rg_use] : send_rating_groups)
     {
-      gy_request.usage_rating_groups.emplace_back(
-        dpi::DiameterSession::GyRequest::UsageRatingGroup(rg_id, rg_use));
+      gy_request.usage_rating_groups.emplace_back(rg_use);
     }
   }
 
@@ -151,7 +162,14 @@ namespace dpi
         {
           if (*rating_group_limit.cc_total_octets > 0)
           {
-            add_limit.gy_recheck_limit = *rating_group_limit.cc_total_octets * 9 / 10;
+            if (rating_group_limit.octets_threshold.has_value())
+            {
+              add_limit.gy_recheck_limit = *rating_group_limit.cc_total_octets - *rating_group_limit.octets_threshold;
+            }
+            else
+            {
+              add_limit.gy_recheck_limit = *rating_group_limit.cc_total_octets * 9 / 10;
+            }
             add_limit.gy_limit = rating_group_limit.cc_total_octets;
           }
           else
@@ -201,7 +219,7 @@ namespace dpi
         request.request_id = gx_request_id;
         request.user_session_traits = user_session_traits;
 
-        std::cout << "========= REQUEST" << std::endl <<
+        std::cout << "========= GX REQUEST" << std::endl <<
           request.to_string() << std::endl <<
           "========================" << std::endl;
 
@@ -410,40 +428,6 @@ namespace dpi
     }
   }
 
-  void
-  Manager::fill_gy_stats_(
-    dpi::DiameterSession::GyRequest& gy_request,
-    dpi::UserSession& user_session)
-  {
-    if (!pcc_config_provider_)
-    {
-      return;
-    }
-
-    auto pcc_config = pcc_config_provider_->get_config();
-
-    if (!pcc_config)
-    {
-      return;
-    }
-
-    auto used_limits = user_session.get_gy_used_limits();
-    for (const auto& used_limit : used_limits)
-    {
-      auto session_rule_it = pcc_config->session_keys.find(used_limit.session_key);
-      if (session_rule_it != pcc_config->session_keys.end())
-      {
-        const dpi::PccConfig::SessionKeyRule& session_key_rule = session_rule_it->second;
-
-        for (const auto& rg_id : session_key_rule.rating_groups)
-        {
-          gy_request.usage_rating_groups.emplace_back(
-            dpi::DiameterSession::GyRequest::UsageRatingGroup(rg_id, used_limit));
-        }
-      }
-    }
-  }
-
   bool Manager::process_request(
     AcctStatusType acct_status_type,
     const UserSessionTraits& user_session_traits)
@@ -481,11 +465,9 @@ namespace dpi
         {
           // fill base user session properties by radius request
           ConstUserSessionPropertyContainerPtr user_session_properties; // TO FIX
-            
 
           user_session = user_session_storage_->add_user_session(
             user_session_traits,
-            ConstUserSessionPropertyContainerPtr(),
             user
           );
 
@@ -512,12 +494,12 @@ namespace dpi
         else if (user_session->is_closed())
         {
           result = false;
-          fail_reason = "session closed";
+          fail_reason = "Session closed";
         }
         else if (acct_status_type == AcctStatusType::UPDATE)
         {
           // update Gy on radius Interim-Update
-          if (!(user_session_traits == *user_session->traits()))
+          if (!(user_session_traits == *user_session->traits())) // TODO: check updates on control properties
           {
             std::cout << "Manager::process_request(): update with traits changes: " << std::endl <<
               "  old: " << user_session->traits()->to_string() << std::endl <<
@@ -527,6 +509,15 @@ namespace dpi
               true, //< update Gx on traits changes ?
               true,
               "radius Interim-Update with changes");
+
+            if (!result)
+            {
+              fail_reason = "Session update returned false";
+            }
+          }
+          else
+          {
+            result = true;
           }
         }
       }
@@ -559,8 +550,7 @@ namespace dpi
     std::cout << "Manager: return " << result <<
       ", acct_status_type = " << (int)acct_status_type <<
       ", msisdn = " << user_session_traits.msisdn <<
-      ", called-station-id = " << user_session_traits.called_station_id <<
-      ", fail_reason = " << fail_reason <<
+      (!result ? std::string(", fail_reason = ") + fail_reason : std::string()) <<
       ", framed_ip_address = " << ipv4_address_to_string(user_session_traits.framed_ip_address) <<
       std::endl;
 
@@ -697,13 +687,21 @@ namespace dpi
     const std::string& gx_session_id,
     bool update_gx,
     bool update_gy,
-    const std::string& reason)
+    const std::string& reason,
+    const std::unordered_set<std::string>& install_charging_rule_names,
+    const std::unordered_set<std::string>& remove_charging_rule_names)
   {
     auto session_suffix = get_session_suffix_(gx_session_id);
     auto user_session = user_session_storage_->get_user_session_by_gx_session_suffix(session_suffix);
     if (user_session)
     {
-      return update_session(*user_session, update_gx, update_gy, reason);
+      return update_session(
+        *user_session,
+        update_gx,
+        update_gy,
+        reason,
+        install_charging_rule_names,
+        remove_charging_rule_names);
     }
     else
     {
@@ -737,7 +735,9 @@ namespace dpi
     dpi::UserSession& user_session,
     bool update_gx,
     bool update_gy,
-    const std::string& reason)
+    const std::string& reason,
+    const std::unordered_set<std::string>& install_charging_rule_names,
+    const std::unordered_set<std::string>& remove_charging_rule_names)
   {
     std::cout << "Manager::update_session(): "
       "msisdn = " << user_session.traits()->msisdn <<
@@ -752,7 +752,41 @@ namespace dpi
       pcc_config = pcc_config_provider_->get_config();
     }
 
-    if (update_gx && gx_diameter_session_)
+    if (!update_gx)
+    {
+      ChargingRuleNameSet new_install_charging_rule_names;
+      ChargingRuleNameSet not_found_charging_rule_names;
+
+      filter_charging_rules_(
+        user_session,
+        new_install_charging_rule_names,
+        not_found_charging_rule_names,
+        install_charging_rule_names);
+
+      auto result_charging_rule_names = user_session.charging_rule_names();
+      result_charging_rule_names.insert(
+        new_install_charging_rule_names.begin(), new_install_charging_rule_names.end());
+      for (const auto& remove_charging_rule_name : remove_charging_rule_names)
+      {
+        result_charging_rule_names.erase(remove_charging_rule_name);
+      }
+
+      user_session.set_charging_rule_names(result_charging_rule_names);
+
+      if (result_charging_rule_names.empty())
+      {
+        // empty charging rules - drop session
+        abort_session(
+          user_session,
+          true,
+          true,
+          true,
+          std::string("Empty charging rules after Gx update"));
+
+        return false;
+      }
+    }
+    else if (gx_diameter_session_)
     {
       dpi::DiameterSession::GxUpdateRequest gx_update_request;
       fill_gx_stats_(gx_update_request, user_session);
@@ -802,6 +836,29 @@ namespace dpi
           logger_->log(ostr.str());
         }
 
+        auto result_charging_rule_names = user_session.charging_rule_names();
+
+        // Apply passed charging rule changes before gx response charging rules.
+        {
+          ChargingRuleNameSet pre_install_charging_rule_names;
+          ChargingRuleNameSet not_found_charging_rule_names;
+
+          filter_charging_rules_(
+            user_session,
+            pre_install_charging_rule_names,
+            not_found_charging_rule_names,
+            install_charging_rule_names);
+
+          result_charging_rule_names.insert(
+            pre_install_charging_rule_names.begin(), pre_install_charging_rule_names.end());
+
+          for (const auto& remove_charging_rule_name : remove_charging_rule_names)
+          {
+            result_charging_rule_names.erase(remove_charging_rule_name);
+          }
+        }
+
+        // Apply response charging rule changes.
         ChargingRuleNameSet new_install_charging_rule_names;
         ChargingRuleNameSet not_found_charging_rule_names;
 
@@ -811,7 +868,6 @@ namespace dpi
           not_found_charging_rule_names,
           response.install_charging_rule_names);
 
-        auto result_charging_rule_names = user_session.charging_rule_names();
         result_charging_rule_names.insert(
           new_install_charging_rule_names.begin(), new_install_charging_rule_names.end());
         for (const auto& remove_charging_rule_name : response.remove_charging_rule_names)
@@ -848,7 +904,7 @@ namespace dpi
         logger_->log("send diameter gy terminate");
 
         DiameterSession::GyRequest gy_update_request; // To fix : use locally
-        fill_gy_request_(gy_update_request, user_session, true);
+        fill_gy_request_(gy_update_request, user_session, false);
         gy_update_request.reason = reason;
 
         // TODO: lock diameter exchange for session
